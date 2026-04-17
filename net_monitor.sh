@@ -354,15 +354,19 @@ loop() {
     local total_width=$((w_if + w_type + w_dir + w_rate + w_sess + w_total + 5*3 + 6))
     local shown_any=0
 
-    while IFS='|' read -r typ k; do
-      [[ -n "${typ:-}" && -n "${k:-}" ]] || continue
+    local prev_group=""
+    while IFS='|' read -r grp typ k hwid; do
+      [[ -n "${grp:-}" && -n "${typ:-}" && -n "${k:-}" ]] || continue
+      if [[ $shown_any -eq 1 && "$grp" != "$prev_group" ]]; then
+        repeat_char "-" "$total_width"
+      fi
       shown_any=1
+      prev_group="$grp"
 
-      local iface_label hwid
+      local iface_label
       local in_rate out_rate in_sess out_sess in_total out_total
 
       if [[ "$typ" == "IP" ]]; then
-        hwid="$(get_ip_hwid "$k")"
         iface_label="$k ($hwid)"
         local prev_rx="${ip_prev_rx[$k]:-${ip_cur_rx[$k]}}"
         local prev_tx="${ip_prev_tx[$k]:-${ip_cur_tx[$k]}}"
@@ -382,7 +386,6 @@ loop() {
         in_total="$(fmt_bytes "${ip_cur_rx[$k]}")"
         out_total="$(fmt_bytes "${ip_cur_tx[$k]}")"
       else
-        hwid="$(get_rdma_hwid "$k")"
         iface_label="$k ($hwid)"
         local prev_rx="${rd_prev_rx[$k]:-${rd_cur_rx[$k]}}"
         local prev_tx="${rd_prev_tx[$k]:-${rd_cur_tx[$k]}}"
@@ -407,22 +410,37 @@ loop() {
         "$iface_label" "$typ" "IN" "$in_rate" "$in_sess" "$in_total"
       printf "%-${w_if}s | %-${w_type}s | %-${w_dir}s | %-${w_rate}s | %-${w_sess}s | %-${w_total}s\n" \
         "" "" "OUT" "$out_rate" "$out_sess" "$out_total"
-      repeat_char "-" "$total_width"
     done < <(
       {
         for k in "${!ip_cur_rx[@]}"; do
           should_show_ip "$k" || continue
-          echo "IP|$k"
+          local hwid group
+          hwid="$(get_ip_hwid "$k")"
+          if [[ "$hwid" == "-" ]]; then
+            group="IP:$k"
+          else
+            group="$hwid"
+          fi
+          echo "$group|IP|$k|$hwid"
         done
         for k in "${!rd_cur_rx[@]}"; do
           should_show_rdma "$k" || continue
-          echo "RDMA|$k"
+          local hwid group
+          hwid="$(get_rdma_hwid "$k")"
+          if [[ "$hwid" == "-" ]]; then
+            group="RDMA:$k"
+          else
+            group="$hwid"
+          fi
+          echo "$group|RDMA|$k|$hwid"
         done
-      } | sort -t'|' -k2,2 -k1,1
+      } | sort -t'|' -k1,1 -k2,2 -k3,3
     )
 
     if [[ $shown_any -eq 0 ]]; then
       echo "(按当前过滤条件未匹配到可显示对象)"
+      repeat_char "-" "$total_width"
+    else
       repeat_char "-" "$total_width"
     fi
 
