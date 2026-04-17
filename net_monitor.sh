@@ -181,7 +181,7 @@ loop() {
     done < <(read_rdma_stats)
 
     print_header
-    for k in "${!ip_cur_rx[@]}"; do
+    while IFS= read -r k; do
       local prev_rx="${ip_prev_rx[$k]:-${ip_cur_rx[$k]}}"
       local prev_tx="${ip_prev_tx[$k]:-${ip_cur_tx[$k]}}"
       local drx=$(( ip_cur_rx[$k] - prev_rx ))
@@ -200,13 +200,13 @@ loop() {
 
       ip_prev_rx["$k"]="${ip_cur_rx[$k]}"
       ip_prev_tx["$k"]="${ip_cur_tx[$k]}"
-    done | sort
+    done < <(printf '%s\n' "${!ip_cur_rx[@]}" | sort)
 
     print_rdma_header
     if [[ ${#rd_cur_rx[@]} -eq 0 ]]; then
       echo "(未发现 RDMA 设备或无可读计数器)"
     else
-      for k in "${!rd_cur_rx[@]}"; do
+      while IFS= read -r k; do
         local prev_rx="${rd_prev_rx[$k]:-${rd_cur_rx[$k]}}"
         local prev_tx="${rd_prev_tx[$k]:-${rd_cur_tx[$k]}}"
         local drx=$(( rd_cur_rx[$k] - prev_rx ))
@@ -228,7 +228,7 @@ loop() {
 
         rd_prev_rx["$k"]="${rd_cur_rx[$k]}"
         rd_prev_tx["$k"]="${rd_cur_tx[$k]}"
-      done | sort
+      done < <(printf '%s\n' "${!rd_cur_rx[@]}" | sort)
     fi
   done
 }
