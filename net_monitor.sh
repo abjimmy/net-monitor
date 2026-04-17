@@ -248,6 +248,7 @@ build_selection_sets() {
 # baseline
 declare -A ip_prev_rx ip_prev_tx ip_base_rx ip_base_tx
 declare -A rd_prev_rx rd_prev_tx rd_base_rx rd_base_tx rd_mode rd_netdev
+declare -A ip_hwid rd_hwid
 
 declare -A sel_ip sel_rd
 
@@ -268,6 +269,43 @@ while IFS='|' read -r k net rx tx mode; do
   rd_netdev["$k"]="$net"
 done < <(read_rdma_stats)
 
+repeat_char() {
+  local char="$1" count="$2"
+  awk -v c="$char" -v n="$count" 'BEGIN{for(i=0;i<n;i++) printf "%s", c; printf "\n"}'
+}
+
+get_ip_hwid() {
+  local iface="$1"
+  if [[ -n "${ip_hwid[$iface]+x}" ]]; then
+    echo "${ip_hwid[$iface]}"
+    return 0
+  fi
+  local p="/sys/class/net/$iface/device"
+  if [[ -e "$p" ]]; then
+    ip_hwid["$iface"]="$(basename "$(readlink -f "$p")")"
+  else
+    ip_hwid["$iface"]="-"
+  fi
+  echo "${ip_hwid[$iface]}"
+}
+
+get_rdma_hwid() {
+  local key="$1"
+  if [[ -n "${rd_hwid[$key]+x}" ]]; then
+    echo "${rd_hwid[$key]}"
+    return 0
+  fi
+  local dev
+  dev="$(rdma_dev_from_key "$key")"
+  local p="/sys/class/infiniband/$dev/device"
+  if [[ -e "$p" ]]; then
+    rd_hwid["$key"]="$(basename "$(readlink -f "$p")")"
+  else
+    rd_hwid["$key"]="-"
+  fi
+  echo "${rd_hwid[$key]}"
+}
+
 print_header() {
   if [[ -t 1 ]]; then clear; else printf "\033c"; fi 2>/dev/null || true
   echo "实时网络监控  时间: $(date '+%F %T %Z')  间隔: ${INTERVAL}s"
@@ -275,20 +313,12 @@ print_header() {
     echo "过滤: ${FILTERS[*]} (自动合并并扩展 IP<->RDMA 对应关系)"
   fi
   echo
-  echo "[IP 网卡]"
-  printf "%-12s %-11s %-11s %-12s %-12s %-12s %-12s\n" \
-    "IFACE" "RX速率" "TX速率" "RX总计(开机)" "TX总计(开机)" "RX累计(本次)" "TX累计(本次)"
-  printf "%-12s %-11s %-11s %-12s %-12s %-12s %-12s\n" \
-    "------------" "-----------" "-----------" "------------" "------------" "------------" "------------"
-}
-
-print_rdma_header() {
-  echo
-  echo "[RDMA 端口]"
-  printf "%-14s %-12s %-11s %-11s %-12s %-12s %-12s %-12s %-7s\n" \
-    "DEV/PORT" "关联NETDEV" "RX速率" "TX速率" "RX总计(开机)" "TX总计(开机)" "RX累计(本次)" "TX累计(本次)" "源"
-  printf "%-14s %-12s %-11s %-11s %-12s %-12s %-12s %-12s %-7s\n" \
-    "--------------" "------------" "-----------" "-----------" "------------" "------------" "------------" "------------" "-------"
+  local w_if=30 w_type=6 w_dir=3 w_rate=14 w_sess=14 w_total=14
+  local total_width=$((w_if + w_type + w_dir + w_rate + w_sess + w_total + 5*3 + 6))
+  repeat_char "=" "$total_width"
+  printf "%-${w_if}s | %-${w_type}s | %-${w_dir}s | %-${w_rate}s | %-${w_sess}s | %-${w_total}s\n" \
+    "INTERFACE (PCI/HW)" "TYPE" "DIR" "CURRENT RATE" "SESSION CUM" "TOTAL (BOOT)"
+  repeat_char "=" "$total_width"
 }
 
 loop() {
@@ -320,68 +350,90 @@ loop() {
     build_selection_sets
 
     print_header
-    while IFS= read -r k; do
-      [[ -n "$k" ]] || continue
-      should_show_ip "$k" || continue
+    local w_if=30 w_type=6 w_dir=3 w_rate=14 w_sess=14 w_total=14
+    local total_width=$((w_if + w_type + w_dir + w_rate + w_sess + w_total + 5*3 + 6))
+    local shown_any=0
 
-      local prev_rx="${ip_prev_rx[$k]:-${ip_cur_rx[$k]}}"
-      local prev_tx="${ip_prev_tx[$k]:-${ip_cur_tx[$k]}}"
-      local drx=$(( ip_cur_rx[$k] - prev_rx ))
-      local dtx=$(( ip_cur_tx[$k] - prev_tx ))
-      ((drx < 0)) && drx=0
-      ((dtx < 0)) && dtx=0
+    while IFS='|' read -r typ k; do
+      [[ -n "${typ:-}" && -n "${k:-}" ]] || continue
+      shown_any=1
 
-      local boot_rx="${ip_cur_rx[$k]}"
-      local boot_tx="${ip_cur_tx[$k]}"
+      local iface_label hwid
+      local in_rate out_rate in_sess out_sess in_total out_total
 
-      local run_rx=$(( ip_cur_rx[$k] - ip_base_rx[$k] ))
-      local run_tx=$(( ip_cur_tx[$k] - ip_base_tx[$k] ))
-      ((run_rx < 0)) && run_rx=0
-      ((run_tx < 0)) && run_tx=0
+      if [[ "$typ" == "IP" ]]; then
+        hwid="$(get_ip_hwid "$k")"
+        iface_label="$k ($hwid)"
+        local prev_rx="${ip_prev_rx[$k]:-${ip_cur_rx[$k]}}"
+        local prev_tx="${ip_prev_tx[$k]:-${ip_cur_tx[$k]}}"
+        local drx=$(( ip_cur_rx[$k] - prev_rx ))
+        local dtx=$(( ip_cur_tx[$k] - prev_tx ))
+        ((drx < 0)) && drx=0
+        ((dtx < 0)) && dtx=0
+        in_rate="$(fmt_rate "$drx" "$INTERVAL")"
+        out_rate="$(fmt_rate "$dtx" "$INTERVAL")"
 
-      printf "%-12s %-11s %-11s %-12s %-12s %-12s %-12s\n" \
-        "$k" "$(fmt_rate "$drx" "$INTERVAL")" "$(fmt_rate "$dtx" "$INTERVAL")" \
-        "$(fmt_bytes "$boot_rx")" "$(fmt_bytes "$boot_tx")" \
-        "$(fmt_bytes "$run_rx")" "$(fmt_bytes "$run_tx")"
+        local run_rx=$(( ip_cur_rx[$k] - ip_base_rx[$k] ))
+        local run_tx=$(( ip_cur_tx[$k] - ip_base_tx[$k] ))
+        ((run_rx < 0)) && run_rx=0
+        ((run_tx < 0)) && run_tx=0
+        in_sess="$(fmt_bytes "$run_rx")"
+        out_sess="$(fmt_bytes "$run_tx")"
+        in_total="$(fmt_bytes "${ip_cur_rx[$k]}")"
+        out_total="$(fmt_bytes "${ip_cur_tx[$k]}")"
+      else
+        hwid="$(get_rdma_hwid "$k")"
+        iface_label="$k ($hwid)"
+        local prev_rx="${rd_prev_rx[$k]:-${rd_cur_rx[$k]}}"
+        local prev_tx="${rd_prev_tx[$k]:-${rd_cur_tx[$k]}}"
+        local drx=$(( rd_cur_rx[$k] - prev_rx ))
+        local dtx=$(( rd_cur_tx[$k] - prev_tx ))
+        ((drx < 0)) && drx=0
+        ((dtx < 0)) && dtx=0
+        in_rate="$(fmt_rate "$drx" "$INTERVAL")"
+        out_rate="$(fmt_rate "$dtx" "$INTERVAL")"
 
+        local run_rx=$(( rd_cur_rx[$k] - rd_base_rx[$k] ))
+        local run_tx=$(( rd_cur_tx[$k] - rd_base_tx[$k] ))
+        ((run_rx < 0)) && run_rx=0
+        ((run_tx < 0)) && run_tx=0
+        in_sess="$(fmt_bytes "$run_rx")"
+        out_sess="$(fmt_bytes "$run_tx")"
+        in_total="$(fmt_bytes "${rd_cur_rx[$k]}")"
+        out_total="$(fmt_bytes "${rd_cur_tx[$k]}")"
+      fi
+
+      printf "%-${w_if}s | %-${w_type}s | %-${w_dir}s | %-${w_rate}s | %-${w_sess}s | %-${w_total}s\n" \
+        "$iface_label" "$typ" "IN" "$in_rate" "$in_sess" "$in_total"
+      printf "%-${w_if}s | %-${w_type}s | %-${w_dir}s | %-${w_rate}s | %-${w_sess}s | %-${w_total}s\n" \
+        "" "" "OUT" "$out_rate" "$out_sess" "$out_total"
+      repeat_char "-" "$total_width"
+    done < <(
+      {
+        for k in "${!ip_cur_rx[@]}"; do
+          should_show_ip "$k" || continue
+          echo "IP|$k"
+        done
+        for k in "${!rd_cur_rx[@]}"; do
+          should_show_rdma "$k" || continue
+          echo "RDMA|$k"
+        done
+      } | sort -t'|' -k2,2 -k1,1
+    )
+
+    if [[ $shown_any -eq 0 ]]; then
+      echo "(按当前过滤条件未匹配到可显示对象)"
+      repeat_char "-" "$total_width"
+    fi
+
+    for k in "${!ip_cur_rx[@]}"; do
       ip_prev_rx["$k"]="${ip_cur_rx[$k]}"
       ip_prev_tx["$k"]="${ip_cur_tx[$k]}"
-    done < <(printf '%s\n' "${!ip_cur_rx[@]}" | sort)
-
-    print_rdma_header
-    local shown_rdma=0
-    while IFS= read -r k; do
-      [[ -n "$k" ]] || continue
-      should_show_rdma "$k" || continue
-      shown_rdma=1
-
-      local prev_rx="${rd_prev_rx[$k]:-${rd_cur_rx[$k]}}"
-      local prev_tx="${rd_prev_tx[$k]:-${rd_cur_tx[$k]}}"
-      local drx=$(( rd_cur_rx[$k] - prev_rx ))
-      local dtx=$(( rd_cur_tx[$k] - prev_tx ))
-      ((drx < 0)) && drx=0
-      ((dtx < 0)) && dtx=0
-
-      local boot_rx="${rd_cur_rx[$k]}"
-      local boot_tx="${rd_cur_tx[$k]}"
-
-      local run_rx=$(( rd_cur_rx[$k] - rd_base_rx[$k] ))
-      local run_tx=$(( rd_cur_tx[$k] - rd_base_tx[$k] ))
-      ((run_rx < 0)) && run_rx=0
-      ((run_tx < 0)) && run_tx=0
-
-      printf "%-14s %-12s %-11s %-11s %-12s %-12s %-12s %-12s %-7s\n" \
-        "$k" "${rd_netdev[$k]}" "$(fmt_rate "$drx" "$INTERVAL")" "$(fmt_rate "$dtx" "$INTERVAL")" \
-        "$(fmt_bytes "$boot_rx")" "$(fmt_bytes "$boot_tx")" \
-        "$(fmt_bytes "$run_rx")" "$(fmt_bytes "$run_tx")" "${rd_mode[$k]}"
-
+    done
+    for k in "${!rd_cur_rx[@]}"; do
       rd_prev_rx["$k"]="${rd_cur_rx[$k]}"
       rd_prev_tx["$k"]="${rd_cur_tx[$k]}"
-    done < <(printf '%s\n' "${!rd_cur_rx[@]}" | sort)
-
-    if [[ $shown_rdma -eq 0 ]]; then
-      echo "(按当前过滤条件未匹配到 RDMA 端口，或无可读计数器)"
-    fi
+    done
   done
 }
 
